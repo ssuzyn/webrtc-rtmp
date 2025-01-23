@@ -11,9 +11,8 @@ const configuration = {
     }]
 };
 
-// WebSocket 연결
 function connect() {
-    if (ws?.readyState === WebSocket.CONNECTING) return; // 이미 연결 시도 중이면 중복 실행 방지
+    if (ws?.readyState === WebSocket.CONNECTING) return;
     
     ws = new WebSocket('ws://localhost:8080');
     
@@ -23,17 +22,16 @@ function connect() {
     };
 
     ws.onclose = () => {
-        console.log('WebSocket connection closed');
         stopStreaming();
-        setTimeout(() => connect(), 3000); // 3초 후 재연결 시도
+        setTimeout(connect, 1000);
     };
 
     ws.onerror = (error) => {
         console.error('WebSocket error:', error);
+        ws.close();
     };
 }
 
-// WebSocket 메시지 처리
 async function handleWebSocketMessage(data) {
     switch(data.type) {
         case 'users':
@@ -54,7 +52,6 @@ async function handleWebSocketMessage(data) {
     }
 }
 
-// 사용자 등록
 async function register() {
     username = document.getElementById('username').value;
     if (!username) return;
@@ -83,84 +80,87 @@ async function register() {
     }
 }
 
-// 스트리밍 컨트롤 초기화
 function initializeStreamingControls() {
     document.getElementById('startStreamBtn').onclick = startStreaming;
     document.getElementById('stopStreamBtn').onclick = stopStreaming;
 }
 
-// 스트리밍 시작
 function startStreaming() {
     if (!localStream || isStreaming) return;
-
-    // FFmpeg를 통한 RTMP 스트리밍 시작 (웹소켓 메시지 전송)
-    // ws.send(JSON.stringify({
-    //     type: 'start-stream',
-    //     username: username,
-    //     streamKey: username
-    // }));
-
-    // isStreaming = true;
     
-    // document.getElementById('startStreamBtn').disabled = true;
-    // document.getElementById('stopStreamBtn').disabled = false;
-    
-    // RTMP 스트림 시작
-    ws.send(JSON.stringify({
-        type: 'start-stream',
-        username: username,
-        streamKey: username
-    }));
+    try {
+        const options = { 
+            mimeType: 'video/webm;codecs=h264,opus',
+            videoBitsPerSecond: 1000000,
+            audioBitsPerSecond: 64000
+        };
+        
+        mediaRecorder = new MediaRecorder(localStream, options);
+        mediaRecorder.ondataavailable = async (event) => {
+            if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                const arrayBuffer = await event.data.arrayBuffer();
+                const chunk = Array.from(new Uint8Array(arrayBuffer));
+                const maxSize = 8192;
+                
+                for(let i = 0; i < chunk.length; i += maxSize) {
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                    ws.send(JSON.stringify({
+                        type: 'stream-data',
+                        username: username,
+                        chunk: chunk.slice(i, i + maxSize)
+                    }));
+                }
+            }
+        };
 
-    // MediaRecorder 설정
-    const options = { mimeType: 'video/webm' };
-    mediaRecorder = new MediaRecorder(localStream, options);
-    
-    mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-            const arrayBuffer = await event.data.arrayBuffer();
-            console.log(`Sending stream chunk of size ${event.data.size} bytes`);
-            ws.send(JSON.stringify({
-                type: 'stream-data',
-                username: username,
-                chunk: Array.from(new Uint8Array(arrayBuffer))
-            }));
-        }
-    };
-
-    mediaRecorder.start(1000); // 1초마다 데이터 전송
-    isStreaming = true;
-    
-    document.getElementById('startStreamBtn').disabled = true;
-    document.getElementById('stopStreamBtn').disabled = false;
+        mediaRecorder.start(500);
+        isStreaming = true;
+    } catch (error) {
+        console.error('Streaming error:', error);
+        isStreaming = false;
+    }
 }
 
-// 스트리밍 종료
 function stopStreaming() {
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         mediaRecorder.stop();
     }
     isStreaming = false;
     
-    ws.send(JSON.stringify({
-        type: 'stop-stream',
-        username: username
-    }));
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'stop-stream',
+            username: username
+        }));
+    }
     
     document.getElementById('startStreamBtn').disabled = false;
     document.getElementById('stopStreamBtn').disabled = true;
 }
 
-// P2P 연결 관리 함수들
 function createPeerConnection(targetUser) {
     const pc = new RTCPeerConnection(configuration);
+
+    pc.onconnectionstatechange = () => {
+        console.log("Connection State:", pc.connectionState);
+    };
     
-    localStream.getTracks().forEach(track => {
-        pc.addTrack(track, localStream);
-    });
+    pc.onsignalingstatechange = () => {
+        console.log("Signaling State:", pc.signalingState);
+    };
+    
+    pc.oniceconnectionstatechange = () => {
+        console.log("ICE Connection State:", pc.iceConnectionState);
+    };
+    
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            pc.addTrack(track, localStream);
+        });
+    }
     
     pc.onicecandidate = (event) => {
-        if (event.candidate) {
+        if (event.candidate && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'ice-candidate',
                 candidate: event.candidate,
@@ -176,42 +176,26 @@ function createPeerConnection(targetUser) {
         video.srcObject = event.streams[0];
     };
 
+    peerConnections.set(targetUser, pc);
     return pc;
 }
 
-function createVideoElement(userId) {
-    const container = document.getElementById('videosContainer');
-    const videoContainer = document.createElement('div');
-    videoContainer.className = 'bg-black rounded-lg overflow-hidden';
-    videoContainer.id = `video-container-${userId}`;
-    
-    const video = document.createElement('video');
-    video.id = `video-${userId}`;
-    video.autoplay = true;
-    video.playsinline = true;
-    video.className = 'w-full h-auto';
-    
-    videoContainer.appendChild(video);
-    container.appendChild(videoContainer);
-    return video;
-}
-
-// WebRTC 시그널링 처리 함수들 (이전과 동일)
 async function handleOffer(data) {
     const pc = createPeerConnection(data.from);
-    peerConnections.set(data.from, pc);
     
     try {
         await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         
-        ws.send(JSON.stringify({
-            type: 'answer',
-            answer: answer,
-            target: data.from,
-            from: username
-        }));
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'answer',
+                answer: answer,
+                target: data.from,
+                from: username
+            }));
+        }
     } catch(err) {
         console.error('Error handling offer:', err);
     }
@@ -239,7 +223,26 @@ async function handleIceCandidate(data) {
     }
 }
 
-// UI 업데이트 함수들
+async function call(targetUser) {
+    const pc = createPeerConnection(targetUser);
+    
+    try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'offer',
+                offer: offer,
+                target: targetUser,
+                from: username
+            }));
+        }
+    } catch(err) {
+        console.error('Error creating offer:', err);
+    }
+}
+
 function updateUserList(users) {
     const ul = document.getElementById('users');
     ul.innerHTML = '';
@@ -259,34 +262,19 @@ function updateUserList(users) {
     });
 }
 
-function removeConnection(userId) {
-    const pc = peerConnections.get(userId);
-    if (pc) {
-        pc.close();
-        peerConnections.delete(userId);
-    }
+function createVideoElement(userId) {
+    const container = document.getElementById('videosContainer');
+    const videoContainer = document.createElement('div');
+    videoContainer.className = 'bg-black rounded-lg overflow-hidden';
+    videoContainer.id = `video-container-${userId}`;
     
-    const videoContainer = document.getElementById(`video-container-${userId}`);
-    if (videoContainer) {
-        videoContainer.remove();
-    }
-}
-
-async function call(targetUser) {
-    const pc = createPeerConnection(targetUser);
-    peerConnections.set(targetUser, pc);
+    const video = document.createElement('video');
+    video.id = `video-${userId}`;
+    video.autoplay = true;
+    video.playsinline = true;
+    video.className = 'w-full h-auto';
     
-    try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        
-        ws.send(JSON.stringify({
-            type: 'offer', 
-            offer: offer,
-            target: targetUser,
-            from: username
-        }));
-    } catch(err) {
-        console.error('Error creating offer:', err);
-    }
+    videoContainer.appendChild(video);
+    container.appendChild(videoContainer);
+    return video;
 }

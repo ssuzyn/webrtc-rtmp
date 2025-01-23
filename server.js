@@ -1,8 +1,18 @@
 const WebSocket = require('ws');
 const NodeMediaServer = require('node-media-server');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
-// RTMP 서버 설정
+const mediaPath = path.join(__dirname, 'media');
+const livePath = path.join(mediaPath, 'live');
+
+[mediaPath, livePath].forEach(dir => {
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o777 });
+    }
+});
+
 const rtmpServer = new NodeMediaServer({
     rtmp: {
         port: 1935,
@@ -13,43 +23,85 @@ const rtmpServer = new NodeMediaServer({
     },
     http: {
         port: 8000,
-        mediaroot: './media',
-        allow_origin: '*'
-    },
-    trans: {
-        ffmpeg: '/usr/local/bin/ffmpeg',
-        tasks: [
-            {
-                app: 'live',
-                hls: true,
-                hlsFlags: '[hls_time=2:hls_list_size=3:hls_flags=delete_segments]'
-            }
-        ]
+        mediaroot: mediaPath,
+        allow_origin: '*',
+        static: true
     }
 });
 
-// WebSocket 서버 설정
 const wss = new WebSocket.Server({ port: 8080 });
+const streamers = new Map();
+const viewers = new Map();
+const peers = new Map();
 
-// 클라이언트 관리
-const streamers = new Map();  // username -> {ws, ffmpeg}
-const viewers = new Map();    // username -> ws
-const peers = new Map();      // username -> ws (WebRTC peers)
+function cleanupOldSegments(streamKey) {
+    const streamPath = path.join(livePath, streamKey);
+    if (fs.existsSync(streamPath)) {
+        fs.readdir(streamPath, (err, files) => {
+            if (err) return;
+            files.forEach(file => {
+                if (file.endsWith('.ts') || file.endsWith('.m3u8')) {
+                    fs.unlink(path.join(streamPath, file), err => {
+                        if (err) console.error(`Error deleting file: ${err}`);
+                    });
+                }
+            });
+        });
+    }
+}
 
 function startFFmpeg(streamKey) {
+    const streamPath = path.join(livePath, streamKey);
+    if (!fs.existsSync(streamPath)) {
+        fs.mkdirSync(streamPath, { recursive: true, mode: 0o777 });
+    }
+
     const ffmpeg = spawn('ffmpeg', [
+        '-fflags', '+igndts',
         '-i', '-',
         '-c:v', 'copy',
         '-c:a', 'aac',
+        '-ar', '44100',
+        '-b:a', '64k',
+        '-bufsize', '4M',
         '-f', 'flv',
-        `rtmp://localhost/live/${streamKey}`
+        `rtmp://localhost/live/${streamKey}`,
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-f', 'hls',
+        '-hls_time', '2',
+        '-hls_list_size', '3',
+        '-hls_flags', 'delete_segments+append_list+omit_endlist',
+        '-hls_segment_type', 'mpegts',
+        '-hls_init_time', '0',
+        '-hls_playlist_type', 'event',
+        '-hls_segment_filename', path.join(streamPath, 'index-%d.ts'),
+        path.join(streamPath, 'index.m3u8')
     ]);
 
-    ffmpeg.stderr.on('data', (data) => {
-        console.log(`FFmpeg: ${data}`);
-    });
+    // symlink 생성
+    const publicPath = path.join(mediaPath, 'live', streamKey);
+    if (!fs.existsSync(publicPath)) {
+        try {
+            fs.symlinkSync(streamPath, publicPath, 'dir');
+        } catch (error) {
+            console.error('Symlink error:', error);
+        }
+    }
 
     return ffmpeg;
+
+    // ffmpeg.stderr.on('data', (data) => console.log(`FFmpeg: ${data}`));
+    // ffmpeg.on('error', (error) => console.error('FFmpeg error:', error));
+    
+    // ffmpeg.stdin.on('error', (error) => {
+    //     console.error('FFmpeg stdin error:', error);
+    //     if (error.code === 'EPIPE') {
+    //         ffmpeg.kill();
+    //     }
+    // });
+
+    // return ffmpeg;
 }
 
 wss.on('connection', (ws) => {
@@ -73,7 +125,6 @@ wss.on('connection', (ws) => {
             case 'viewer-join':
                 handleViewerJoin(ws, data);
                 break;
-            // WebRTC 시그널링 메시지
             case 'offer':
             case 'answer':
             case 'ice-candidate':
@@ -82,12 +133,10 @@ wss.on('connection', (ws) => {
         }
     });
 
-    ws.on('close', () => {
-        handleDisconnect(ws);
-    });
+    ws.on('close', () => handleDisconnect(ws));
+    ws.on('error', (error) => console.error('WebSocket error:', error));
 });
 
-// 메시지 핸들러 함수들
 function handleRegister(ws, data) {
     const { username, isStreamer } = data;
     if (isStreamer) {
@@ -101,25 +150,61 @@ function handleRegister(ws, data) {
 function handleStreamStart(ws, data) {
     const streamer = streamers.get(data.username);
     if (streamer) {
+        if (streamer.ffmpeg) {
+            streamer.ffmpeg.kill();
+        }
+        
+        cleanupOldSegments(data.streamKey);
         const ffmpeg = startFFmpeg(data.streamKey);
         streamer.ffmpeg = ffmpeg;
+        
+        ffmpeg.on('close', (code) => {
+            console.log(`FFmpeg process closed with code ${code}`);
+            if (streamer.ffmpeg === ffmpeg) {
+                delete streamer.ffmpeg;
+            }
+            broadcast({
+                type: 'stream-info',
+                streams: Array.from(streamers.keys())
+            });
+        });
+        
+        broadcast({
+            type: 'stream-info',
+            streams: Array.from(streamers.keys())
+        });
     }
 }
 
 function handleStreamData(data) {
     const streamer = streamers.get(data.username);
-    if (streamer && streamer.ffmpeg) {
+    if (!streamer?.ffmpeg?.stdin?.writable) return;
+
+    try {
         const buffer = Buffer.from(data.chunk);
-        streamer.ffmpeg.stdin.write(buffer);
+        const writeSuccess = streamer.ffmpeg.stdin.write(buffer);
+        
+        if (!writeSuccess) {
+            streamer.ffmpeg.stdin.once('drain', () => {
+                handleStreamData(data);
+            });
+        }
+    } catch (error) {
+        console.error('Stream data handling error:', error);
+        handleStreamStop(data);
     }
 }
 
 function handleStreamStop(data) {
     const streamer = streamers.get(data.username);
-    if (streamer && streamer.ffmpeg) {
+    if (streamer?.ffmpeg) {
         streamer.ffmpeg.stdin.end();
         streamer.ffmpeg.kill();
         delete streamer.ffmpeg;
+        broadcast({
+            type: 'stream-info',
+            streams: Array.from(streamers.keys())
+        });
     }
 }
 
@@ -132,66 +217,57 @@ function handleViewerJoin(ws, data) {
 }
 
 function handleDisconnect(ws) {
-  // Find and remove disconnected user
-  let disconnectedUser;
-  
-  for (const [username, conn] of streamers.entries()) {
-      if (conn.ws === ws) {
-          handleStreamStop({ username });
-          streamers.delete(username);
-          disconnectedUser = username;
-          break;
-      }
-  }
-  
-  if (!disconnectedUser) {
-      for (const [username, conn] of peers.entries()) {
-          if (conn === ws) {
-              peers.delete(username);
-              disconnectedUser = username;
-              break;
-          }
-      }
-  }
-  
-  if (disconnectedUser) {
-      broadcastUserList();
-      broadcast({
-          type: 'user-disconnected',
-          username: disconnectedUser
-      });
-  }
+    let disconnectedUser;
+    
+    for (const [username, conn] of streamers.entries()) {
+        if (conn.ws === ws) {
+            handleStreamStop({ username });
+            streamers.delete(username);
+            disconnectedUser = username;
+            break;
+        }
+    }
+    
+    if (!disconnectedUser) {
+        for (const [username, conn] of peers.entries()) {
+            if (conn === ws) {
+                peers.delete(username);
+                disconnectedUser = username;
+                break;
+            }
+        }
+    }
+
+    if (disconnectedUser) {
+        broadcastUserList();
+        broadcast({
+            type: 'user-disconnected',
+            username: disconnectedUser
+        });
+    }
 }
 
 function broadcastUserList() {
-  const users = [...streamers.keys(), ...peers.keys()];
-  broadcast({
-      type: 'users',
-      users: users
-  });
+    broadcast({
+        type: 'users',
+        users: [...streamers.keys(), ...peers.keys()]
+    });
 }
 
 function broadcast(data) {
-  const message = JSON.stringify(data);
-  for (const conn of streamers.values()) {
-      conn.ws.send(message);
-  }
-  for (const conn of peers.values()) {
-      conn.send(message);
-  }
+    const message = JSON.stringify(data);
+    [...streamers.values()].forEach(conn => conn.ws.send(message));
+    [...peers.values()].forEach(conn => conn.send(message));
+    [...viewers.values()].forEach(conn => conn.send(message));
 }
 
 function forwardMessage(data) {
-  const target = data.target;
-  const targetWs = peers.get(target) || streamers.get(target)?.ws;
-  
-  if (targetWs) {
-      targetWs.send(JSON.stringify(data));
-  }
+    const targetWs = peers.get(data.target) || streamers.get(data.target)?.ws;
+    if (targetWs) {
+        targetWs.send(JSON.stringify(data));
+    }
 }
 
-// Start RTMP server
 rtmpServer.run();
-
 console.log('WebSocket server running on port 8080');
 console.log('RTMP server running on port 1935');
